@@ -5,9 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+)
+
+// logging flags, for internal use
+var (
+	logRequests  bool
+	logResponses bool
 )
 
 const DefaultAddress = "http://localhost:7474/db/data/"
@@ -39,7 +47,9 @@ func (n neo4j) request(method string, urlStr string, body interface{}, result in
 		}
 	}
 
-	fmt.Println(urlStr)
+	if logRequests {
+		log.Println(method, urlStr)
+	}
 
 	r, err := http.NewRequest(method, urlStr, jsonBody)
 	if err != nil {
@@ -57,7 +67,13 @@ func (n neo4j) request(method string, urlStr string, body interface{}, result in
 	}
 	defer resp.Body.Close()
 
-	dec := json.NewDecoder(resp.Body)
+	var reader io.Reader = resp.Body
+	if logResponses {
+		log.Println(resp.StatusCode)
+		reader = io.TeeReader(resp.Body, os.Stderr)
+	}
+
+	dec := json.NewDecoder(reader)
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		var respError Neo4jError
 		err := dec.Decode(&respError)
@@ -162,8 +178,22 @@ func (r ServiceRoot) RelationshipTypes() ([]string, error) {
 	return types, nil
 }
 
+type cypherQuery struct {
+	Query  string `json:"query"`
+	Params M      `json:"params"`
+}
+
+func (r ServiceRoot) Cypher(query string, params M) (M, error) {
+	var m M
+	err := r.request("POST", r.CypherURL, cypherQuery{query, params}, &m)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (r ServiceRoot) CreateNode(properties M) (*Node, error) {
-	return r.node("PUT", r.NodeURL, properties)
+	return r.node("POST", r.NodeURL, properties)
 }
 
 func (r ServiceRoot) GetReferenceNode() (*Node, error) {
