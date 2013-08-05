@@ -6,15 +6,75 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
-type Neo4j struct {
+const DefaultAddress = "http://localhost:7474/db/data/"
+
+type M map[string]interface{}
+
+type neo4j struct {
 	SelfURL string `json:"self,omitempty"`
 	Client  *http.Client
 }
 
-func (n Neo4j) node(method, u string, properties M) (*Node, error) {
+func marshallBody(v interface{}) (io.Reader, error) {
+	var body io.Reader = nil
+	jsonValue, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	body = bytes.NewReader(jsonValue)
+	return body, nil
+}
+
+func (n neo4j) request(method string, urlStr string, body interface{}, result interface{}) error {
+	var jsonBody io.Reader
+	if body != nil {
+		var err error
+		jsonBody, err = marshallBody(body)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println(urlStr)
+
+	r, err := http.NewRequest(method, urlStr, jsonBody)
+	if err != nil {
+		return err
+	}
+
+	r.Header.Add("Accept", "application/json")
+	if method == "PUT" {
+		r.Header.Add("Content-Type", "application/json")
+	}
+
+	resp, err := n.Client.Do(r)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		var respError Neo4jError
+		err := dec.Decode(&respError)
+		if err != nil {
+			return fmt.Errorf("error decoding server error: %s", err)
+		}
+		return specificError(respError)
+	}
+
+	err = dec.Decode(result)
+	if err != nil {
+		return fmt.Errorf("error decoding server response: %s", err)
+	}
+	return nil
+}
+
+func (n neo4j) node(method, u string, properties M) (*Node, error) {
 	var node Node
 	err := n.request(method, u, properties, &node)
 	if err != nil {
@@ -23,7 +83,7 @@ func (n Neo4j) node(method, u string, properties M) (*Node, error) {
 	return &node, nil
 }
 
-func (n Neo4j) properties(method, u string, properties M) (M, error) {
+func (n neo4j) properties(method, u string, properties M) (M, error) {
 	var m M
 	err := n.request(method, u, properties, &m)
 	if err != nil {
@@ -32,7 +92,7 @@ func (n Neo4j) properties(method, u string, properties M) (M, error) {
 	return m, nil
 }
 
-func (n Neo4j) relationship(method, u string, properties M) (*Relationship, error) {
+func (n neo4j) relationship(method, u string, properties M) (*Relationship, error) {
 	var r Relationship
 	err := n.request("POST", u, properties, &r)
 	if err != nil {
@@ -41,7 +101,7 @@ func (n Neo4j) relationship(method, u string, properties M) (*Relationship, erro
 	return &r, nil
 }
 
-func (n Neo4j) relationships(method, u string) ([]Relationship, error) {
+func (n neo4j) relationships(method, u string) ([]Relationship, error) {
 	var r []Relationship
 	err := n.request(method, u, nil, &r)
 	if err != nil {
@@ -79,8 +139,66 @@ type ServiceRoot struct {
 	serviceRoot
 }
 
+func Open(addr string) (*ServiceRoot, error) {
+	if len(addr) == 0 {
+		addr = DefaultAddress
+	}
+	var root ServiceRoot
+	neo := neo4j{SelfURL: addr, Client: &http.Client{}}
+	err := neo.request("GET", neo.SelfURL, nil, &root)
+	if err != nil {
+		return nil, err
+	}
+	root.neo4j = neo
+	return &root, nil
+}
+
+func (r ServiceRoot) RelationshipTypes() ([]string, error) {
+	var types []string
+	err := r.request("GET", r.RelationshipTypesURL, nil, &types)
+	if err != nil {
+		return nil, err
+	}
+	return types, nil
+}
+
+func (r ServiceRoot) CreateNode(properties M) (*Node, error) {
+	return r.node("PUT", r.NodeURL, properties)
+}
+
+func (r ServiceRoot) GetReferenceNode() (*Node, error) {
+	return r.node("GET", r.ReferenceNodeURL, nil)
+}
+
+func (r ServiceRoot) GetNode(id int) (*Node, error) {
+	return r.node("GET", fmt.Sprintf("%s/%d", r.NodeURL, id), nil)
+}
+
+func (r ServiceRoot) DeleteNode(id int) error {
+	return r.request("DELETE", fmt.Sprintf("%s/%d", r.NodeURL, id), nil, nil)
+}
+
+func (n ServiceRoot) GetRelationship(id uint) (*Relationship, error) {
+	// Wait till https://github.com/neo4j/community/issues/750 is resolved
+	/*
+		r, err := n.request("GET", n.RelationshipURL, nil)
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		if err != nil {
+			return nil ,err
+		}
+	*/
+	return nil, nil
+}
+
+func (n ServiceRoot) DeleteRelationship(id uint) error {
+	// See above
+	return nil
+}
+
 type serviceRoot struct {
-	Neo4j
+	neo4j
 	NodeURL              string `json:"node"`
 	ReferenceNodeURL     string `json:"reference_node,omitempty"`
 	NodeIndexURL         string `json:"node_index"`
@@ -94,6 +212,17 @@ type serviceRoot struct {
 
 type Node struct {
 	node
+}
+
+// Id returns the unique node identifier.
+// It returns -1 if the identifier cannot be determined.
+func (n Node) Id() int {
+	s := strings.Split(n.SelfURL, "/")
+	id, err := strconv.ParseInt(s[len(s)-1], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return int(id)
 }
 
 func (n Node) GetProperties() (M, error) {
@@ -142,7 +271,7 @@ func (n Node) GetTypedRelationships(types []string) ([]Relationship, error) {
 }
 
 type node struct {
-	Neo4j
+	neo4j
 	SelfURL                       string `json:"self"`
 	PagedTraverseURL              string `json:"paged_traverse"`
 	OutgoingRelationshipsURL      string `json:"outgoing_relationships"`
@@ -158,78 +287,6 @@ type node struct {
 
 type Relationship struct {
 	relationship
-}
-
-type relationship struct {
-	Neo4j
-	SelfURL       string `json:"self"`
-	Type          string `json:"type"`
-	StartURL      string `json:"start"`
-	PropertyURL   string `json:"property"`
-	PropertiesURL string `json:"properties"`
-	EndURL        string `json:"end"`
-}
-
-const DefaultAddress = "http://localhost:7474/db/data/"
-
-type M map[string]interface{}
-
-func Open(addr string) (*ServiceRoot, error) {
-	if len(addr) == 0 {
-		addr = DefaultAddress
-	}
-	var root ServiceRoot
-	neo := Neo4j{SelfURL: addr, Client: &http.Client{}}
-	err := neo.request("GET", neo.SelfURL, nil, &root)
-	if err != nil {
-		return nil, err
-	}
-	root.Neo4j = neo
-	return &root, nil
-}
-
-func (r ServiceRoot) Cypher(query string, params M) {
-
-}
-
-func (r ServiceRoot) RelationshipTypes() ([]string, error) {
-	var types []string
-	err := r.request("GET", r.RelationshipTypesURL, nil, &types)
-	if err != nil {
-		return nil, err
-	}
-	return types, nil
-}
-
-func (r ServiceRoot) CreateNode(properties M) (*Node, error) {
-	return r.node("PUT", r.NodeURL, properties)
-}
-
-func (r ServiceRoot) GetNode(id int) (*Node, error) {
-	return r.node("GET", fmt.Sprintf("%s/%d", r.NodeURL, id), nil)
-}
-
-func (r ServiceRoot) DeleteNode(id int) error {
-	return r.request("DELETE", fmt.Sprintf("%s/%d", r.NodeURL, id), nil, nil)
-}
-
-func (n ServiceRoot) GetRelationship(id uint) (*Relationship, error) {
-	// Wait till https://github.com/neo4j/community/issues/750 is resolved
-	/*
-		r, err := n.request("GET", n.RelationshipURL, nil)
-		if resp != nil {
-			defer resp.Body.Close()
-		}
-		if err != nil {
-			return nil ,err
-		}
-	*/
-	return nil, nil
-}
-
-func (n ServiceRoot) DeleteRelationship(id uint) error {
-	// See above
-	return nil
 }
 
 func (r Relationship) StartNode() (*Node, error) {
@@ -248,57 +305,12 @@ func (r Relationship) SetProperties(p M) error {
 	return r.request("PUT", r.PropertiesURL, p, nil)
 }
 
-func marshallBody(v interface{}) (io.Reader, error) {
-	var body io.Reader = nil
-	jsonValue, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	body = bytes.NewReader(jsonValue)
-	return body, nil
-}
-
-func (n Neo4j) request(method string, urlStr string, body interface{}, result interface{}) error {
-	var jsonBody io.Reader
-	if body != nil {
-		var err error
-		jsonBody, err = marshallBody(body)
-		if err != nil {
-			return err
-		}
-	}
-
-	fmt.Println(urlStr)
-
-	r, err := http.NewRequest(method, urlStr, jsonBody)
-	if err != nil {
-		return err
-	}
-
-	r.Header.Add("Accept", "application/json")
-	if method == "PUT" {
-		r.Header.Add("Content-Type", "application/json")
-	}
-
-	resp, err := n.Client.Do(r)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	dec := json.NewDecoder(resp.Body)
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		var respError Neo4jError
-		err := dec.Decode(&respError)
-		if err != nil {
-			return fmt.Errorf("error decoding server error: %s", err)
-		}
-		return specificError(respError)
-	}
-
-	err = dec.Decode(result)
-	if err != nil {
-		return fmt.Errorf("error decoding server response: %s", err)
-	}
-	return nil
+type relationship struct {
+	neo4j
+	SelfURL       string `json:"self"`
+	Type          string `json:"type"`
+	StartURL      string `json:"start"`
+	PropertyURL   string `json:"property"`
+	PropertiesURL string `json:"properties"`
+	EndURL        string `json:"end"`
 }
